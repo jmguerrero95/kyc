@@ -242,7 +242,32 @@ License: For each use you must have a valid license purchased only from above li
     transform: scaleX(-1);
 }
 
-#status {
+    #startButton {
+    position: absolute;
+    bottom: 18%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #742ACE;
+    color: #fff;
+    border: none;
+    padding: 12px 28px;
+    font-size: clamp(16px, 4vw, 18px);
+    border-radius: 999px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+    cursor: pointer;
+    font-family: 'Poppins', 'Arial', sans-serif;
+    display: none;
+    align-items: center;
+    gap: 8px;
+    z-index: 12;
+}
+
+#startButton:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+    #status {
     position: absolute;
     bottom: 5%; /* Cambiado de 'top' a 'bottom' para alejarlo de la barra de URL */
     left: 50%;
@@ -708,6 +733,7 @@ License: For each use you must have a valid license purchased only from above li
     <div id="video-container">
       <video id="video" playsinline webkit-playsinline autoplay muted></video>
       <canvas id="overlayCanvas" style="position: absolute; top: 0; left: 0; transform: scaleX(-1); pointer-events: none; width: auto !important; height: auto !important;"></canvas>
+      <button id="startButton" type="button">Iniciar verificación</button>
       <p id="status">Esperando prueba...</p>
       <div id="calibration-progress-container">
       <div id="calibration-progress-bar"></div>
@@ -931,24 +957,30 @@ const { FaceLandmarker, FilesetResolver, DrawingUtils } = vision;
 // Elementos del DOM
 const video = document.getElementById("video"); 
 const statusText = document.getElementById("status"); 
-const startButton = document.getElementById("startButton"); 
-const overlayCanvas = document.getElementById("overlayCanvas"); 
+const startButton = document.getElementById("startButton");
+const overlayCanvas = document.getElementById("overlayCanvas");
 const calibrationProgressContainer = document.getElementById("calibration-progress-container");
 const calibrationProgressBar = document.getElementById("calibration-progress-bar");
-let canvasCtx = null; 
-let drawingUtilsInstance = null; 
+let canvasCtx = null;
+let drawingUtilsInstance = null;
 
 let stream2 = null;
-let faceLandmarkerInstance = null; 
-let faceLandmarkerInitialized = false; 
-let calibratedCenterAngles = null; 
+let faceLandmarkerInstance = null;
+let faceLandmarkerInitialized = false;
+let faceLandmarkerInitializationPromise = null;
+let calibratedCenterAngles = null;
 
 let awaitingFaceFrameCounter = 0;
-const MAX_AWAITING_FACE_FRAMES_MEDIAPIPE = 75; 
+const MAX_AWAITING_FACE_FRAMES_MEDIAPIPE = 75;
+const CALIBRATION_DROPOUT_TOLERANCE_FRAMES = 12;
+const TRACKING_DROPOUT_TOLERANCE_FRAMES = 18;
+const HEAD_POSE_SMOOTHING_ALPHA = 0.35;
 
-let loopCallCount = 0; 
-let lastVideoTime = -1; 
-let currentRunningMode= "IMAGE"; 
+let loopCallCount = 0;
+let lastVideoTime = -1;
+let currentRunningMode= "IMAGE";
+let trackingDropoutFrames = 0;
+let smoothedAngles = null;
 
 const HEAD_POSE_CHALLENGE_STATE = {
     NONE: 'none',
@@ -979,7 +1011,63 @@ let livenessAttempts = 0;
 const MAX_LIVENESS_ATTEMPTS = 3;
 const CALIBRATION_FRAMES_HEAD_POSE = 30; 
 let calibrationFramesCount_HeadPose = 0;
-let collectedCalibrationAngles = []; 
+let collectedCalibrationAngles = [];
+
+function showStartButton(label = "Iniciar verificación") {
+    if (!startButton) return;
+    startButton.style.display = 'flex';
+    startButton.disabled = false;
+    startButton.textContent = label;
+}
+
+function hideStartButton() {
+    if (!startButton) return;
+    startButton.style.display = 'none';
+}
+
+async function getUserMediaWithFallback() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Navegador sin soporte para cámara.');
+    }
+
+    const constraintsList = [
+        { video: { facingMode: { ideal: "user" }, width: { ideal: 640 }, height: { ideal: 480 } } },
+        { video: { facingMode: "user" } },
+        { video: true }
+    ];
+
+    let lastError = null;
+    for (const constraints of constraintsList) {
+        try {
+            return await navigator.mediaDevices.getUserMedia(constraints);
+        } catch (error) {
+            lastError = error;
+            console.warn('[MEDIAPIPE_CAMERA] Falla con constraints', constraints, error);
+        }
+    }
+
+    throw lastError || new Error('No fue posible acceder a la cámara.');
+}
+
+if (startButton) {
+    startButton.addEventListener('click', async () => {
+        if (startButton.disabled) return;
+        startButton.disabled = true;
+        startButton.textContent = 'Iniciando...';
+
+        if (!faceLandmarkerInstance || !faceLandmarkerInitialized) {
+            startButton.textContent = 'Cargando modelos...';
+            const modelsInitialized = await initializeMediaPipeTask();
+            if (!modelsInitialized) {
+                showStartButton('Reintentar verificación');
+                return;
+            }
+            startButton.textContent = 'Iniciando...';
+        }
+
+        await startCameraInternal();
+    });
+}
 
 function adjustCanvasToVideo() {
     if (!video || !overlayCanvas ) {
@@ -1047,7 +1135,20 @@ function adjustCanvasToVideo() {
 }
 
 
-async function initializeMediaPipeTask() { 
+async function initializeMediaPipeTask() {
+    if (faceLandmarkerInitialized && faceLandmarkerInstance) {
+        return true;
+    }
+    if (faceLandmarkerInitializationPromise) {
+        try {
+            await faceLandmarkerInitializationPromise;
+        } catch (error) {
+            console.error('[MEDIAPIPE_LOAD] Error durante inicialización concurrente:', error);
+        }
+        return faceLandmarkerInitialized;
+    }
+
+    faceLandmarkerInitializationPromise = (async () => {
     currentChallengeState = HEAD_POSE_CHALLENGE_STATE.LOADING_MODELS;
     updateInstruction();
 
@@ -1091,10 +1192,12 @@ async function initializeMediaPipeTask() {
         console.log("[MEDIAPIPE_LOAD] ANTES de FaceLandmarker.createFromOptions()...");
         faceLandmarkerInstance = await FaceLandmarker.createFromOptions(filesetResolver, faceLandmarkerOptions);
         console.log("[MEDIAPIPE_LOAD] DESPUÉS de FaceLandmarker.createFromOptions() - MediaPipe FaceLandmarker inicializado exitosamente.");
-        faceLandmarkerInitialized = true; 
-        
+        faceLandmarkerInitialized = true;
+
         if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.LOADING_MODELS) {
             currentChallengeState = HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE;
+            smoothedAngles = null;
+            trackingDropoutFrames = 0;
             updateInstruction();
         }
         return true;
@@ -1102,16 +1205,26 @@ async function initializeMediaPipeTask() {
         console.error("[MEDIAPIPE_LOAD] Error CRÍTICO GENERAL al inicializar MediaPipe FaceLandmarker:", error);
         if (statusText) statusText.textContent = "Error crítico al cargar modelos de IA. Intenta recargar o verifica la consola.";
         faceLandmarkerInitialized = false;
-        currentChallengeState = HEAD_POSE_CHALLENGE_STATE.NONE; 
-        updateInstruction(); 
+        currentChallengeState = HEAD_POSE_CHALLENGE_STATE.NONE;
+        smoothedAngles = null;
+        trackingDropoutFrames = 0;
+        updateInstruction();
         if (startButton && startButton.disabled) startButton.disabled = false;
         return false;
+    }
+    })();
+
+    try {
+        const result = await faceLandmarkerInitializationPromise;
+        return result;
+    } finally {
+        faceLandmarkerInitializationPromise = null;
     }
 }
 
 async function startCameraInternal() {
     if (!video || !statusText) { console.error("[MEDIAPIPE_CAMERA] Elementos de video o status no encontrados."); if(startButton) startButton.disabled = false; return;}
-    
+
     if (!faceLandmarkerInitialized || !faceLandmarkerInstance) {
         console.error("[MEDIAPIPE_CAMERA] FaceLandmarker no está inicializado. No se puede iniciar la cámara para detección.");
         if(statusText) statusText.textContent = "Error: Componente de IA no listo.";
@@ -1122,17 +1235,21 @@ async function startCameraInternal() {
     updateInstruction();
     livenessAttempts = 0; currentChallengeIndex = 0; calibratedCenterAngles = null;
     calibrationFramesCount_HeadPose = 0; collectedCalibrationAngles = [];
-    poseAttemptTimer = 0; poseVerificationFrames = 0; awaitingFaceFrameCounter = 0; 
+    poseAttemptTimer = 0; poseVerificationFrames = 0; awaitingFaceFrameCounter = 0;
+    trackingDropoutFrames = 0; smoothedAngles = null;
     try {
         if (stream2) { stream2.getTracks().forEach(track => track.stop()); stream2 = null; }
-        stream2 = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } } });
-        video.srcObject = stream2; video.style.display = "block"; 
-        if(startButton) startButton.style.display = 'none'; 
+        stream2 = await getUserMediaWithFallback();
+        video.srcObject = stream2; video.style.display = "block";
+        if (video.hasAttribute('muted') === false) { video.setAttribute('muted', ''); }
+        video.muted = true;
+        video.setAttribute('playsinline', '');
+        if(startButton) hideStartButton();
 
-        video.onloadedmetadata = () => { 
-            adjustCanvasToVideo(); 
+        video.onloadedmetadata = () => {
+            adjustCanvasToVideo();
 
-            video.play().then(async () => { 
+            video.play().then(async () => {
                 console.log(`[MEDIAPIPE_CAMERA] Video metadata cargado y reproduciendo. Resolución real: ${video.videoWidth}x${video.videoHeight}`);
                 
                 if (currentRunningMode === "IMAGE") {
@@ -1146,10 +1263,23 @@ async function startCameraInternal() {
                 lastVideoTime = -1; 
                 console.log("[MEDIAPIPE_CAMERA] Video listo. Iniciando bucle de detección MediaPipe.");
                 detectFaceLandmarksLoopMediaPipe(); 
-            }).catch(playError => { console.error("[MEDIAPIPE_CAMERA] Error al reproducir video:", playError); if(statusText) statusText.textContent = "Error al reproducir video."; if(startButton) { startButton.disabled = false; startButton.style.display = 'block';} stopCamera(); });
+            }).catch(playError => { console.error("[MEDIAPIPE_CAMERA] Error al reproducir video:", playError); if(statusText) statusText.textContent = "Error al reproducir video."; if(startButton) { showStartButton('Reintentar verificación'); startButton.disabled = false; } stopCamera(); });
         };
         video.onerror = (e) => { console.error("[MEDIAPIPE_CAMERA] Error en el elemento video:", e); if(statusText) statusText.textContent = "Error con el stream de video."; stopCamera();};
-    } catch (err) { console.error("[MEDIAPIPE_CAMERA] Error al acceder a la cámara: ", err); if(statusText) statusText.textContent = `Error al acceder a la cámara. Verifica permisos.`; currentChallengeState = HEAD_POSE_CHALLENGE_STATE.NONE; updateInstruction(); if(startButton) { startButton.disabled = false; startButton.style.display = 'block';}}
+    } catch (err) {
+        console.error("[MEDIAPIPE_CAMERA] Error al acceder a la cámara: ", err);
+        if(statusText) {
+            if (err && err.name === 'NotAllowedError') {
+                statusText.textContent = 'Permite el acceso a la cámara para continuar.';
+            } else {
+                statusText.textContent = `Error al acceder a la cámara. Verifica permisos.`;
+            }
+        }
+        currentChallengeState = HEAD_POSE_CHALLENGE_STATE.NONE; updateInstruction();
+        if(startButton) {
+            showStartButton(err && err.name === 'NotAllowedError' ? 'Abrir cámara' : 'Reintentar verificación');
+        }
+    }
 }
 
 function detectFaceLandmarksLoopMediaPipe() {
@@ -1170,10 +1300,10 @@ function detectFaceLandmarksLoopMediaPipe() {
             currentChallengeState === HEAD_POSE_CHALLENGE_STATE.CHALLENGE_FAILED_FINAL) {
             console.log(`[MEDIAPIPE_LOOP] Deteniendo: Condición de parada. VPaused: ${video?.paused}, VEnded: ${video?.ended}, Stream: ${!!stream2}, SActive: ${video?.srcObject?.active}, Estado: ${currentChallengeState}`);
             shouldRequestNextFrame = false; 
-            if (currentChallengeState !== HEAD_POSE_CHALLENGE_STATE.ALL_CHALLENGES_PASSED && 
+            if (currentChallengeState !== HEAD_POSE_CHALLENGE_STATE.ALL_CHALLENGES_PASSED &&
                 currentChallengeState !== HEAD_POSE_CHALLENGE_STATE.CHALLENGE_FAILED_FINAL) {
-                 if(startButton && startButton.style.display === 'none') { 
-                    startButton.style.display = 'block'; startButton.disabled = false;
+                 if(startButton) {
+                    showStartButton('Reintentar verificación');
                  }
             }
             if (canvasCtx) canvasCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height); 
@@ -1215,13 +1345,14 @@ function detectFaceLandmarksLoopMediaPipe() {
                     setTimeout(stopCamera, 2000); shouldRequestNextFrame = false; return;
                 } else { 
                     currentChallengeState = HEAD_POSE_CHALLENGE_STATE.CHALLENGE_FAILED_ATTEMPT; updateInstruction();
-                    setTimeout(() => { 
-                        currentChallengeState = HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE; 
-                        currentChallengeIndex = 0; calibratedCenterAngles = null; 
+                    setTimeout(() => {
+                        currentChallengeState = HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE;
+                        currentChallengeIndex = 0; calibratedCenterAngles = null;
                         calibrationFramesCount_HeadPose = 0; collectedCalibrationAngles = [];
                         poseAttemptTimer = 0; awaitingFaceFrameCounter = 0;
+                        smoothedAngles = null; trackingDropoutFrames = 0;
                         updateInstruction();
-                    }, 2500); 
+                    }, 2500);
                 }
             }
         }
@@ -1242,7 +1373,8 @@ function detectFaceLandmarksLoopMediaPipe() {
         }
 
         if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
-            if (canvasCtx && drawingUtilsInstance) { 
+            trackingDropoutFrames = 0;
+            if (canvasCtx && drawingUtilsInstance) {
                 for (const landmarks of results.faceLandmarks) {
                     drawingUtilsInstance.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_TESSELATION, {color: '#7546F870', lineWidth: 1});
                     drawingUtilsInstance.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, {color: '#7546F870'});
@@ -1263,15 +1395,42 @@ function detectFaceLandmarksLoopMediaPipe() {
                     console.log(`[MEDIAPIPE_LOOP] Landmarks detectados, pero no se encontró matriz facial en estado ${currentChallengeState}.`);
                 }
             }
-        } else { 
+        } else {
+            trackingDropoutFrames++;
             if (currentChallengeState !== HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE && loopCallCount % 30 === 0) {
-                console.log(`[MEDIAPIPE_LOOP] No se detectaron landmarks en estado ${currentChallengeState}.`);
+                console.log(`[MEDIAPIPE_LOOP] No se detectaron landmarks en estado ${currentChallengeState}. Misses=${trackingDropoutFrames}`);
             }
+
             if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.CALIBRATING_CENTER) {
-                calibrationFramesCount_HeadPose = 0; collectedCalibrationAngles = [];
-                updateInstruction();
-            } else if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.VERIFYING_POSE) {
-                poseVerificationFrames = 0;
+                if (trackingDropoutFrames >= CALIBRATION_DROPOUT_TOLERANCE_FRAMES) {
+                    console.warn(`[MEDIAPIPE_CALIBRATION] Pérdida del rostro por ${trackingDropoutFrames} frames. Reiniciando calibración.`);
+                    calibrationFramesCount_HeadPose = 0;
+                    collectedCalibrationAngles = [];
+                    calibratedCenterAngles = null;
+                    smoothedAngles = null;
+                    currentChallengeState = HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE;
+                    trackingDropoutFrames = 0;
+                    updateInstruction();
+                }
+            } else if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.VERIFYING_POSE ||
+                       currentChallengeState === HEAD_POSE_CHALLENGE_STATE.CHALLENGE_PENDING) {
+                if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.VERIFYING_POSE) {
+                    poseVerificationFrames = 0;
+                    poseAttemptTimer = Math.max(0, poseAttemptTimer - 5);
+                }
+                if (trackingDropoutFrames >= TRACKING_DROPOUT_TOLERANCE_FRAMES) {
+                    console.warn(`[MEDIAPIPE_TRACKING] Seguimiento perdido durante desafío por ${trackingDropoutFrames} frames. Volviendo a calibrar.`);
+                    poseVerificationFrames = 0;
+                    poseAttemptTimer = 0;
+                    currentChallengeIndex = 0;
+                    calibratedCenterAngles = null;
+                    calibrationFramesCount_HeadPose = 0;
+                    collectedCalibrationAngles = [];
+                    smoothedAngles = null;
+                    currentChallengeState = HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE;
+                    trackingDropoutFrames = 0;
+                    updateInstruction();
+                }
             }
         }
 
@@ -1288,9 +1447,9 @@ function detectFaceLandmarksLoopMediaPipe() {
 
 function getAnglesFromMatrix(matrixData) {
     let pitch, yaw, roll;
-    pitch = Math.atan2(matrixData[9], matrixData[10]); 
-    const sinYaw = -matrixData[8]; 
-    if (Math.abs(sinYaw) >= 1) { 
+    pitch = Math.atan2(matrixData[9], matrixData[10]);
+    const sinYaw = -matrixData[8];
+    if (Math.abs(sinYaw) >= 1) {
         yaw = Math.PI / 2 * Math.sign(sinYaw);
     } else {
         yaw = Math.asin(sinYaw);
@@ -1304,10 +1463,26 @@ function getAnglesFromMatrix(matrixData) {
     };
 }
 
+function smoothAngles(newAngles) {
+    if (!smoothedAngles) {
+        smoothedAngles = { ...newAngles };
+        return { ...smoothedAngles };
+    }
+
+    smoothedAngles = {
+        yaw: smoothedAngles.yaw + HEAD_POSE_SMOOTHING_ALPHA * (newAngles.yaw - smoothedAngles.yaw),
+        pitch: smoothedAngles.pitch + HEAD_POSE_SMOOTHING_ALPHA * (newAngles.pitch - smoothedAngles.pitch),
+        roll: smoothedAngles.roll + HEAD_POSE_SMOOTHING_ALPHA * (newAngles.roll - smoothedAngles.roll)
+    };
+
+    return { ...smoothedAngles };
+}
+
 function processDetectedFaceMediaPipe(matrixData) {
-    const angles = getAnglesFromMatrix(matrixData);
+    const rawAngles = getAnglesFromMatrix(matrixData);
+    const stableAngles = smoothAngles(rawAngles);
     if (loopCallCount % 15 === 0) {
-        console.log(`[MEDIAPIPE_PROCESS] Ángulos: Yaw=${angles.yaw.toFixed(1)}, Pitch=${angles.pitch.toFixed(1)}, Roll=${angles.roll.toFixed(1)}`);
+        console.log(`[MEDIAPIPE_PROCESS] Ángulos: Yaw=${rawAngles.yaw.toFixed(1)}, Pitch=${rawAngles.pitch.toFixed(1)}, Roll=${rawAngles.roll.toFixed(1)} | Suavizados: Yaw=${stableAngles.yaw.toFixed(1)}, Pitch=${stableAngles.pitch.toFixed(1)}, Roll=${stableAngles.roll.toFixed(1)}`);
     }
 
     // ---- INICIO DE LA MODIFICACIÓN ----
@@ -1327,7 +1502,7 @@ function processDetectedFaceMediaPipe(matrixData) {
         // pero si ya estaba en CALIBRATING_CENTER, actualiza el progreso.
         if (!collectedCalibrationAngles) collectedCalibrationAngles = []; // Asegurar que el array exista
 
-        collectedCalibrationAngles.push(angles);
+        collectedCalibrationAngles.push(stableAngles);
         calibrationFramesCount_HeadPose++;
         updateInstruction(); // Actualiza el mensaje con el progreso de la calibración
 
@@ -1354,7 +1529,9 @@ function processDetectedFaceMediaPipe(matrixData) {
         (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.VERIFYING_POSE || currentChallengeState === HEAD_POSE_CHALLENGE_STATE.CHALLENGE_PENDING)) {
         console.warn("[MEDIAPIPE_PROCESS] calibratedCenterAngles no definido. Reiniciando a AWAITING_FACE.");
         currentChallengeState = HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE;
-        awaitingFaceFrameCounter = 0; updateInstruction(); return;
+        awaitingFaceFrameCounter = 0; smoothedAngles = null; trackingDropoutFrames = 0;
+        updateInstruction();
+        return;
     }
 
     if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.CHALLENGE_PENDING) {
@@ -1367,17 +1544,19 @@ function processDetectedFaceMediaPipe(matrixData) {
         const currentTargetChallenge = CHALLENGE_SEQUENCE[currentChallengeIndex];
         let poseDetected = false;
 
-        // Calcula los deltas originales (puedes renombrar estas variables si ya usas deltaYaw/deltaPitch)
-        const rawDeltaYaw = angles.yaw - calibratedCenterAngles.yaw;
-        const rawDeltaPitch = angles.pitch - calibratedCenterAngles.pitch;
+        // Calcula los deltas con los ángulos suavizados para evitar parpadeos
+        const smoothedDeltaYaw = stableAngles.yaw - calibratedCenterAngles.yaw;
+        const smoothedDeltaPitch = stableAngles.pitch - calibratedCenterAngles.pitch;
 
         // Invierte los deltas para corregir la detección invertida
-        const deltaYaw = -rawDeltaYaw;
-        const deltaPitch = -rawDeltaPitch;
-        
+        const deltaYaw = -smoothedDeltaYaw;
+        const deltaPitch = -smoothedDeltaPitch;
+
         // Puedes mantener o añadir un log para depuración si lo deseas:
-        if (loopCallCount % 30 === 0) { 
-            console.log(`[MEDIAPIPE_VERIFY] RawDeltas: dYaw=${rawDeltaYaw.toFixed(1)}, dPitch=${rawDeltaPitch.toFixed(1)}`);
+        if (loopCallCount % 30 === 0) {
+            const rawDeltaYaw = rawAngles.yaw - calibratedCenterAngles.yaw;
+            const rawDeltaPitch = rawAngles.pitch - calibratedCenterAngles.pitch;
+            console.log(`[MEDIAPIPE_VERIFY] RawDeltas: dYaw=${rawDeltaYaw.toFixed(1)}, dPitch=${rawDeltaPitch.toFixed(1)} | Suavizados: dYaw=${smoothedDeltaYaw.toFixed(1)}, dPitch=${smoothedDeltaPitch.toFixed(1)}`);
             console.log(`[MEDIAPIPE_VERIFY] CorrectedDeltas: dYaw=${deltaYaw.toFixed(1)}, dPitch=${deltaPitch.toFixed(1)} (Target: ${currentTargetChallenge})`);
         }
 
@@ -1391,7 +1570,7 @@ function processDetectedFaceMediaPipe(matrixData) {
                 // La condición original es: Math.abs(rawDeltaYaw) < YAW_THRESHOLD_DEGREES * 0.7 && Math.abs(rawDeltaPitch) < PITCH_THRESHOLD_DEGREES * 0.7
                 // Esta debería seguir funcionando bien con los deltas originales (rawDeltaYaw, rawDeltaPitch) ya que es simétrica.
                 // O si prefieres consistencia, usa los deltas invertidos, pero el Math.abs() lo hará igual.
-                if (Math.abs(rawDeltaYaw) < YAW_THRESHOLD_DEGREES * 0.7 && Math.abs(rawDeltaPitch) < PITCH_THRESHOLD_DEGREES * 0.7) { 
+                if (Math.abs(smoothedDeltaYaw) < YAW_THRESHOLD_DEGREES * 0.7 && Math.abs(smoothedDeltaPitch) < PITCH_THRESHOLD_DEGREES * 0.7) {
                     poseDetected = true;
                 }
                 break;
@@ -1474,7 +1653,9 @@ function updateInstruction() {
         case HEAD_POSE_CHALLENGE_STATE.NONE:
             // instruction = startButton ? 'Haz clic en "Iniciar Verificación" cuando estés listo.' : 'Listo para iniciar la verificación facial.';
             // Como startButton no parece estar en uso activo para esta fase:
-            instruction = 'Listo para iniciar la verificación facial.';
+            instruction = startButton && startButton.style.display !== 'none'
+                ? 'Presiona "Iniciar verificación" para comenzar.'
+                : 'Listo para iniciar la verificación facial.';
             break;
         case HEAD_POSE_CHALLENGE_STATE.LOADING_MODELS:
             instruction = "Cargando modelos de IA (MediaPipe)...";
@@ -1617,7 +1798,7 @@ function takeSnapshotAndSendData() {
     }, "image/jpeg", 0.9);
 }
 
-function stopCamera() { 
+function stopCamera() {
     console.log(`[MEDIAPIPE_STOP] Función stopCamera. Estado: ${currentChallengeState}`);
     if (stream2) {
         stream2.getTracks().forEach(track => track.stop());
@@ -1627,19 +1808,25 @@ function stopCamera() {
         video.srcObject = null;
         video.style.display = "none";
     }
-    if (canvasCtx) { 
+    if (canvasCtx) {
         canvasCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
     }
-    
+
+    smoothedAngles = null;
+    trackingDropoutFrames = 0;
+
     if (currentChallengeState !== HEAD_POSE_CHALLENGE_STATE.ALL_CHALLENGES_PASSED &&
         currentChallengeState !== HEAD_POSE_CHALLENGE_STATE.CHALLENGE_FAILED_FINAL) {
         currentChallengeState = HEAD_POSE_CHALLENGE_STATE.NONE;
     }
     updateInstruction();
 
-    if(startButton) { 
-        startButton.disabled = false;
-        startButton.style.display = 'block';
+    if(startButton) {
+        if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.ALL_CHALLENGES_PASSED) {
+            hideStartButton();
+        } else {
+            showStartButton('Reintentar verificación');
+        }
     }
     console.log(`[MEDIAPIPE_STOP] Cámara y proceso detenidos. Estado final: ${currentChallengeState}`);
 }
@@ -1653,44 +1840,53 @@ function getParameterByName(name, url = window.location.href) {
     return decodeURIComponent(results[2].replace(/\+/g, ' '));
 }
 
-window.iniciarFeDeVida = async function() { 
+window.iniciarFeDeVida = async function() {
     const currentVideoElement = document.getElementById("video");
     const currentStatusElement = document.getElementById("status");
 
-    if (!currentVideoElement || !currentStatusElement) { 
+    if (!currentVideoElement || !currentStatusElement) {
         console.error("[MEDIAPIPE_INIT] Elementos de UI (video/status) no encontrados.");
         return;
     }
     console.log("[MEDIAPIPE_INIT] window.iniciarFeDeVida() llamada.");
-    if(startButton) startButton.disabled = true;
+    if(startButton) {
+        showStartButton('Preparando...');
+        startButton.disabled = true;
+    }
 
-    loopCallCount = 0; 
+    loopCallCount = 0;
 
-    if (typeof vision === 'undefined') { 
+    if (typeof vision === 'undefined') {
         console.error("[MEDIAPIPE_INIT] El módulo 'vision' de MediaPipe no está definido. Asegúrate de que la importación ES Module al inicio del script esté funcionando y que el script se cargue como type='module'.");
         if(statusText) statusText.textContent = "Error crítico: Fallo al cargar librería de IA.";
-        if(startButton) startButton.disabled = false;
+        if(startButton) showStartButton('Reintentar verificación');
         return;
     }
 
-    if (!faceLandmarkerInstance) { 
-        const modelsInitialized = await initializeMediaPipeTask(); 
+    if (!faceLandmarkerInstance) {
+        const modelsInitialized = await initializeMediaPipeTask();
         if (!modelsInitialized) {
-            if(startButton && startButton.disabled) startButton.disabled = false;
-            return; 
+            if(startButton) showStartButton('Reintentar verificación');
+            return;
         }
-    } else { 
-        if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.NONE || 
-            currentChallengeState === HEAD_POSE_CHALLENGE_STATE.LOADING_MODELS || 
-            currentChallengeState === HEAD_POSE_CHALLENGE_STATE.CHALLENGE_FAILED_FINAL || 
-            currentChallengeState === HEAD_POSE_CHALLENGE_STATE.ALL_CHALLENGES_PASSED) { 
+    } else {
+        if (currentChallengeState === HEAD_POSE_CHALLENGE_STATE.NONE ||
+            currentChallengeState === HEAD_POSE_CHALLENGE_STATE.LOADING_MODELS ||
+            currentChallengeState === HEAD_POSE_CHALLENGE_STATE.CHALLENGE_FAILED_FINAL ||
+            currentChallengeState === HEAD_POSE_CHALLENGE_STATE.ALL_CHALLENGES_PASSED) {
             currentChallengeState = HEAD_POSE_CHALLENGE_STATE.AWAITING_FACE;
+            smoothedAngles = null;
+            trackingDropoutFrames = 0;
             updateInstruction();
         }
     }
-    
-    awaitingFaceFrameCounter = 0; 
-    await startCameraInternal(); 
+
+    awaitingFaceFrameCounter = 0;
+    if (startButton) {
+        showStartButton('Iniciar verificación');
+    } else {
+        await startCameraInternal();
+    }
 }
 
 console.log("Script de liveness (MediaPipe FaceLandmarker con Malla - ES Module v0.10.3) cargado. Esperando llamada a iniciarFeDeVida().");
